@@ -5,12 +5,16 @@
 """Tests for LLM invocation helpers."""
 
 import contextlib
+import json
 import threading
 import time
 from typing import Any
 from unittest.mock import MagicMock
 
+import anthropic
+import httpx2
 import pytest
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
@@ -497,3 +501,166 @@ def test_missing_reasoning_client_keeps_the_original_failure(monkeypatch: Any) -
     monkeypatch.setattr(llm_invoke, "get_llm_client", unavailable)
 
     assert llm_invoke.invoke_with_structured_output(primary, [], _Schema) is None
+
+
+def _anthropic_client(
+    monkeypatch: pytest.MonkeyPatch, model: str, response: dict[str, Any]
+) -> tuple[Any, list[dict[str, Any]]]:
+    """A real ChatAnthropic from ``_build_client`` answering from a fake transport."""
+    monkeypatch.delenv("ANTHROPIC_API_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append({"url": str(request.url), "body": json.loads(request.content)})
+        return httpx2.Response(200, json=response)
+
+    llm = llm_invoke._build_client(
+        model=model,
+        api_key="sk-ant-test",
+        base_url="https://integrate.api.nvidia.com/v1",
+        temperature=0.0,
+        max_tokens=512,
+    )
+    llm.__dict__["_client"] = anthropic.Anthropic(
+        api_key="sk-ant-test",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+    )
+    return llm, requests
+
+
+def _message(content: list[dict[str, Any]], stop_reason: str) -> dict[str, Any]:
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-5-5",
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+class _Answer(BaseModel):
+    value: str
+
+
+_TOOL_CALL = {
+    "type": "tool_use",
+    "id": "t1",
+    "name": "_Answer",
+    "input": {"value": "x"},
+}
+
+
+@pytest.mark.filterwarnings("ignore:You are attempting to use structured output")
+def test_anthropic_model_calls_anthropic_without_rejected_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key stays off the NVIDIA endpoint and Opus 5.5's 400s are not triggered."""
+    llm, requests = _anthropic_client(
+        monkeypatch,
+        "anthropic/claude-opus-5-5",
+        _message([_TOOL_CALL], "tool_use"),
+    )
+
+    result = llm_invoke.safe_invoke_with_structured_output(
+        llm,
+        [
+            SystemMessage(content="s"),
+            HumanMessage(content="q"),
+            SystemMessage(content="r"),
+        ],
+        _Answer,
+    )
+
+    assert result == _Answer(value="x")
+    assert requests[0]["url"].startswith("https://api.anthropic.com/")
+    body = requests[0]["body"]
+    assert body["model"] == "claude-opus-5-5"
+    assert body["fallbacks"] == "default"
+    assert "temperature" not in body
+    assert "tool_choice" not in body
+
+
+def test_anthropic_model_without_server_fallback_omits_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm, requests = _anthropic_client(
+        monkeypatch,
+        "anthropic/claude-haiku-5-5",
+        _message([_TOOL_CALL], "tool_use"),
+    )
+
+    llm_invoke.safe_invoke_with_structured_output(
+        llm, [HumanMessage(content="q")], _Answer
+    )
+
+    assert "fallbacks" not in requests[0]["body"]
+
+
+@pytest.mark.filterwarnings("ignore:You are attempting to use structured output")
+def test_anthropic_answer_without_tool_call_is_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm_invoke.time, "sleep", lambda _: None)
+    llm, requests = _anthropic_client(
+        monkeypatch,
+        "anthropic/claude-opus-5-5",
+        _message([{"type": "text", "text": "no tool"}], "end_turn"),
+    )
+
+    with pytest.raises(OutputParserException):
+        llm_invoke.safe_invoke_with_structured_output(
+            llm, [HumanMessage(content="q")], _Answer
+        )
+
+    assert len(requests) == llm_invoke.RETRY_MAX_ATTEMPTS
+
+
+def test_anthropic_text_response_drops_thinking_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm, _ = _anthropic_client(
+        monkeypatch,
+        "anthropic/claude-opus-5-5",
+        _message(
+            [
+                {"type": "thinking", "thinking": "", "signature": "s"},
+                {"type": "text", "text": "hello"},
+            ],
+            "end_turn",
+        ),
+    )
+
+    assert llm_invoke.safe_invoke_text(llm, "q") == "hello"
+    assert llm_invoke.invoke_text(llm, "q") == "hello"
+
+
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [(400, False), (401, False), (404, False), (429, True), (500, True), (529, True)],
+)
+def test_anthropic_status_codes_classify_for_retry(
+    monkeypatch: pytest.MonkeyPatch, status: int, retryable: bool
+) -> None:
+    """ChatAnthropic wraps SDK errors in subclasses; the base class must still match."""
+    llm, _ = _anthropic_client(monkeypatch, "anthropic/claude-opus-5-5", {})
+    llm.__dict__["_client"] = anthropic.Anthropic(
+        api_key="sk-ant-test",
+        max_retries=0,
+        http_client=httpx2.Client(
+            transport=httpx2.MockTransport(
+                lambda _: httpx2.Response(
+                    status,
+                    json={"type": "error", "error": {"type": "x", "message": "m"}},
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(anthropic.APIStatusError) as caught:
+        llm.invoke("q")
+
+    assert llm_invoke._is_retryable(caught.value) is retryable

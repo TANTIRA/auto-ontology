@@ -32,6 +32,7 @@ build artifact — see `pyproject.toml`, `frontend/package.json`, and the
 | hvac | >=2.4.0 | Apache-2.0 | https://github.com/hvac/hvac |
 | importlib-metadata | >=8.7.1 | Apache-2.0 | https://github.com/python/importlib_metadata |
 | kumo-relational-client (`kumo-relational-client[relational]`) | >=1.0.0,<2 | Apache-2.0 — see note below | https://github.com/NVIDIA/kumo-relational-client |
+| langchain-anthropic | >=1.7.10 | MIT | https://github.com/langchain-ai/langchain |
 | langchain-core | >=1.6.1 | MIT | https://github.com/langchain-ai/langchain |
 | langchain-nvidia-ai-endpoints | >=1.4.3 | MIT | https://github.com/langchain-ai/langchain-nvidia |
 | langchain-openai | >=1.3.0,<1.3.5 | MIT | https://github.com/langchain-ai/langchain |

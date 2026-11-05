@@ -172,14 +172,19 @@ _RETRYABLE_EXCEPTION_TYPES = frozenset(
         "APITimeoutError",
         "RateLimitError",
         "ServiceUnavailableError",
+        # ChatAnthropic raises this when a Claude model that cannot be forced to
+        # call the tool answers in text instead; the next attempt usually calls it.
+        "OutputParserException",
     }
 )
 
 
 def _is_retryable(e: Exception) -> bool:
     """Whether *e* signals a transient, retryable server condition."""
-    return any(tok in str(e) for tok in _RETRYABLE_TOKENS) or (
-        type(e).__name__ in _RETRYABLE_EXCEPTION_TYPES
+    # The whole MRO, because ChatAnthropic re-raises SDK errors as its own subclasses
+    # (AnthropicOverloadedError is an InternalServerError).
+    return any(tok in str(e) for tok in _RETRYABLE_TOKENS) or any(
+        cls.__name__ in _RETRYABLE_EXCEPTION_TYPES for cls in type(e).__mro__
     )
 
 
@@ -210,6 +215,10 @@ _NON_REASONING_BASE_URL = resolve("NON_REASONING", "ENDPOINT")
 _NON_REASONING_MODEL_NAME = resolve("NON_REASONING", "MODEL")
 _NON_REASONING_API_KEY = resolve("NON_REASONING", "API_KEY")
 
+# Claude models whose safety-classifier declines can be re-run server side. SQL
+# generation has hit false-positive declines (see text_to_sql/models.py).
+_SERVER_FALLBACK_MODELS = ("claude-fable-5-1", "claude-opus-5", "claude-sonnet-5-5")
+
 
 def _build_client(
     *,
@@ -221,10 +230,34 @@ def _build_client(
 ) -> BaseChatModel:
     """Build a chat client for the given model/endpoint.
 
-    OpenAI-family models (``openai/``, ``azure/``, ``aws/`` prefixes) go through
-    ``ChatOpenAI``, which supports structured output. Everything else uses
-    ``ChatNVIDIA``.
+    ``anthropic/`` models call the Anthropic API directly through
+    ``ChatAnthropic``. OpenAI-family models (``openai/``, ``azure/``, ``aws/``
+    prefixes) go through ``ChatOpenAI``, which supports structured output.
+    Everything else uses ``ChatNVIDIA``.
     """
+    if model.startswith("anthropic/"):
+        from langchain_anthropic import ChatAnthropic
+
+        name = model.removeprefix("anthropic/")
+        # base_url is ignored on purpose: it can inherit an NVIDIA default, which
+        # must never receive an Anthropic key. ANTHROPIC_BASE_URL still overrides.
+        # temperature is omitted because current Claude models reject it.
+        return ChatAnthropic(
+            model=name,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            timeout=LLM_INVOKE_TIMEOUT_S,
+            max_retries=0,
+            **(
+                {
+                    "betas": ["server-side-fallback-2026-07-01"],
+                    "model_kwargs": {"fallbacks": "default"},
+                }
+                if name.startswith(_SERVER_FALLBACK_MODELS)
+                else {}
+            ),
+        )
+
     if model.startswith(("openai/", "azure/", "aws/")):
         from langchain_openai import ChatOpenAI
 
@@ -477,10 +510,24 @@ def _structured_output_kwargs(llm: BaseChatModel) -> dict:
     return {}
 
 
-def _invoke_text_once(llm: BaseChatModel, prompt: str) -> str:
-    response = llm.invoke([HumanMessage(content=prompt)])
+def _response_text(response: object) -> str:
+    """The text of an LLM *response*, without its thinking blocks.
+
+    ``ChatAnthropic`` returns a list of content blocks whenever the response holds
+    more than one text block, which is always on models that think by default.
+    """
     content = getattr(response, "content", response)
+    if isinstance(content, list):
+        return "".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
     return content if isinstance(content, str) else str(content)
+
+
+def _invoke_text_once(llm: BaseChatModel, prompt: str) -> str:
+    return _response_text(llm.invoke([HumanMessage(content=prompt)]))
 
 
 def invoke_text(llm: BaseChatModel, prompt: str) -> str:
@@ -511,8 +558,7 @@ def _safe_invoke_text(llm: BaseChatModel, prompt: str) -> str:
         try:
             with _inflight_guard():
                 response = llm.invoke(messages)
-            content = getattr(response, "content", response)
-            return content if isinstance(content, str) else str(content)
+            return _response_text(response)
         except _requests.exceptions.ReadTimeout:
             logger.error(
                 "LLM invoke timed out after %ds on attempt %d/%d",

@@ -27,6 +27,13 @@ import os
 # safe hardcoded default and fall back to ``DEFAULT_MODELS_API_KEY`` /
 # ``NVIDIA_API_KEY`` instead).
 _DEFAULTS_BY_KEY_PREFIX: dict[str, dict[str, str]] = {
+    # Anthropic API (sk-ant-... keys). Must precede "sk-", which would otherwise
+    # match and send the key to NVIDIA. No embedding or rerank defaults: those need
+    # their own triplets, and an empty endpoint fails rather than leaking the key.
+    "sk-ant-": {
+        "REASONING_MODEL": "anthropic/claude-opus-5-5",
+        "NON_REASONING_MODEL": "anthropic/claude-opus-5-5",
+    },
     # inference-api.nvidia.com (sk-... keys).
     "sk-": {
         "REASONING_ENDPOINT": "https://inference-api.nvidia.com/v1",

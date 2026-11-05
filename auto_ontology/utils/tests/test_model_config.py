@@ -68,3 +68,15 @@ def test_an_explicit_setting_wins_over_the_default(
     clean_env.setenv("REASONING_MODEL", "nvidia/some-other-model")
 
     assert model_config.resolve("REASONING", "MODEL") == "nvidia/some-other-model"
+
+
+def test_anthropic_key_gets_claude_and_no_nvidia_endpoint(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """``sk-ant-`` also starts with ``sk-``, whose defaults point at NVIDIA."""
+    clean_env.setenv("REASONING_API_KEY", "sk-ant-test")
+    clean_env.setenv("EMBED_API_KEY", "sk-ant-test")
+
+    assert model_config.resolve("REASONING", "MODEL") == "anthropic/claude-opus-5-5"
+    assert model_config.resolve("REASONING", "ENDPOINT") == ""
+    assert model_config.resolve("EMBED", "ENDPOINT") == ""
